@@ -8,15 +8,16 @@ import googlemaps
 import plotly.express as px
 
 # ---------------------------------------------------------
-# 🚨 파일 이름 설정 (업로드한 엑셀 파일명 정확히 입력)
+# 🚨 파일 이름 설정 (업로드한 엑셀 파일명)
 # ---------------------------------------------------------
 CRIME_FILE_NAME = "2023_berlin_crime.xlsx"
 
 # ---------------------------------------------------------
 # 1. 설정 및 API 키
 # ---------------------------------------------------------
-st.set_page_config(layout="wide", page_title="베를린 통합 가이드")
+st.set_page_config(layout="wide", page_title="베를린 OSM 통합 가이드")
 
+# 구글맵 키는 로드하지만, 장소 검색은 OSM을 우선 사용합니다.
 GMAPS_API_KEY = st.secrets.get("google_maps_api_key", "")
 GEMINI_API_KEY = st.secrets.get("gemini_api_key", "")
 
@@ -28,7 +29,7 @@ if GEMINI_API_KEY:
         pass
 
 # ---------------------------------------------------------
-# 2. 데이터 처리 (엑셀 읽기 + 전처리)
+# 2. 데이터 처리 (엑셀 로드 + OSM 데이터)
 # ---------------------------------------------------------
 @st.cache_data
 def get_exchange_rate():
@@ -49,19 +50,18 @@ def get_weather():
         return {"temperature": 15.0, "weathercode": 0}
 
 @st.cache_data
-def load_crime_data(file_name):
+def load_crime_data_excel(file_name):
     """
-    엑셀 파일을 읽어서 지도/통계용 데이터프레임으로 변환
+    엑셀 파일을 읽고 지도/통계용으로 전처리합니다.
     """
     try:
-        # 1. 엑셀 읽기 (앞 4줄 건너뛰기)
+        # 1. 엑셀 읽기
         df = pd.read_excel(file_name, skiprows=4, engine='openpyxl')
 
-        # 2. 컬럼명 정리 (\n 제거)
+        # 2. 컬럼명 정리
         df.columns = [str(c).replace('\n', ' ').strip() for c in df.columns]
 
-        # 3. 구 이름 확인
-        # 파일마다 컬럼명이 다를 수 있어 'Bezeichnung'이 포함된 컬럼 찾기
+        # 3. 구 이름 컬럼 찾기
         district_col = None
         for c in df.columns:
             if 'Bezeichnung' in c:
@@ -70,30 +70,30 @@ def load_crime_data(file_name):
         
         if not district_col: return pd.DataFrame()
 
-        # 4. 베를린 12개 구 이름만 필터링 (지도 GeoJSON 매칭용)
+        # 4. 베를린 12개 구만 필터링
         berlin_districts = [
             "Mitte", "Friedrichshain-Kreuzberg", "Pankow", "Charlottenburg-Wilmersdorf", 
             "Spandau", "Steglitz-Zehlendorf", "Tempelhof-Schöneberg", "Neukölln", 
             "Treptow-Köpenick", "Marzahn-Hellersdorf", "Lichtenberg", "Reinickendorf"
         ]
         df = df[df[district_col].isin(berlin_districts)].copy()
+
+        # 5. 숫자 데이터 정제 (점 제거 후 숫자 변환)
+        # 문자열이 섞인 숫자 컬럼들을 모두 처리
+        cols_to_clean = [c for c in df.columns if c != district_col and 'LOR' not in c]
         
-        # 5. 숫자 변환 (1.000 -> 1000, 빈칸 -> 0)
-        # 범죄 유형 컬럼들(숫자형)만 골라서 처리
-        cols_to_clean = [c for c in df.columns if c not in [district_col, 'LOR-Schlüssel (Bezirksregion)']]
         for c in cols_to_clean:
             df[c] = df[c].astype(str).str.replace('.', '', regex=False)
             df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
 
-        # 6. 컬럼명 표준화 (District)
+        # 6. 컬럼명 표준화
         df = df.rename(columns={district_col: 'District'})
         
-        # 총계 컬럼 찾기 ('insgesamt'가 포함된 컬럼)
-        total_col = [c for c in df.columns if 'insgesamt' in c and 'Straftaten' in c]
-        if total_col:
-            df['Total_Crime'] = df[total_col[0]]
+        # 총계 컬럼 생성 (없으면 합산)
+        total_col_name = [c for c in df.columns if 'Straftaten' in c and 'insgesamt' in c]
+        if total_col_name:
+            df['Total_Crime'] = df[total_col_name[0]]
         else:
-            # 없으면 숫자 컬럼 다 더해서 만듦
             df['Total_Crime'] = df[cols_to_clean].sum(axis=1)
 
         return df
@@ -103,9 +103,12 @@ def load_crime_data(file_name):
 
 @st.cache_data
 def get_osm_places(category, lat, lng, radius_m=3000):
-    """OSM 장소 데이터 가져오기"""
+    """
+    OpenStreetMap(Overpass API)을 사용하여 장소 데이터를 가져옵니다.
+    """
     overpass_url = "http://overpass-api.de/api/interpreter"
     
+    tag = ""
     if category == 'restaurant': tag = '["amenity"="restaurant"]'
     elif category == 'hotel': tag = '["tourism"="hotel"]'
     elif category == 'tourism': tag = '["tourism"~"attraction|museum|artwork|viewpoint"]'
@@ -125,11 +128,10 @@ def get_osm_places(category, lat, lng, radius_m=3000):
         for element in data['elements']:
             if 'tags' in element and 'name' in element['tags']:
                 name = element['tags']['name']
-                # 구글 링크
+                # 구글 검색 링크 생성
                 search_query = f"{name} Berlin".replace(" ", "+")
                 link = f"https://www.google.com/search?q={search_query}"
                 
-                # 설명 텍스트
                 desc = "장소"
                 if category == 'restaurant': 
                     cuisine = element['tags'].get('cuisine', '일반')
@@ -144,7 +146,10 @@ def get_osm_places(category, lat, lng, radius_m=3000):
         return results
     except: return []
 
-def search_location(query):
+def search_location_osm(query):
+    """
+    OpenStreetMap(Nominatim)을 사용하여 무료로 좌표를 검색합니다.
+    """
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {'q': query, 'format': 'json', 'limit': 1}
@@ -164,7 +169,7 @@ def get_gemini_response(prompt):
     except: return "AI 서비스 오류"
 
 # ---------------------------------------------------------
-# 3. 데이터 정의 (여행 코스)
+# 3. 여행 코스 데이터
 # ---------------------------------------------------------
 courses = {
     "🌳 Theme 1: 숲과 힐링": [
@@ -212,24 +217,24 @@ courses = {
 }
 
 # ---------------------------------------------------------
-# 4. UI 구성
+# 4. 메인 화면 구성
 # ---------------------------------------------------------
 st.title("🇩🇪 베를린 통합 여행 가이드")
-st.caption("2023년 데이터 기반 안전 여행 & 추천 코스")
+st.caption("OpenStreetMap & Excel 데이터 기반")
 
-# 세션 상태
+# 세션 초기화
 if 'reviews' not in st.session_state: st.session_state['reviews'] = {}
 if 'recommendations' not in st.session_state: st.session_state['recommendations'] = []
 if 'messages' not in st.session_state: st.session_state['messages'] = []
 if 'map_center' not in st.session_state: st.session_state['map_center'] = [52.5200, 13.4050]
 if 'search_marker' not in st.session_state: st.session_state['search_marker'] = None
 
-# 상단: 환율 & 날씨
-c1, c2 = st.columns(2)
-with c1:
+# [1] 환율 & 날씨
+col1, col2 = st.columns(2)
+with col1:
     rate = get_exchange_rate()
     st.metric("💶 유로 환율", f"{rate:.0f}원", delta="1 EUR 기준")
-with c2:
+with col2:
     w = get_weather()
     st.metric("⛅ 베를린 날씨", f"{w['temperature']}°C")
 
@@ -238,22 +243,24 @@ st.divider()
 # --- 사이드바 ---
 st.sidebar.title("🛠️ 여행 도구")
 
-# 검색
+# 1. 검색 (OSM Nominatim 사용 - 무료)
 st.sidebar.subheader("📍 장소 이동")
 search_query = st.sidebar.text_input("지역 이름 (예: Mitte)", placeholder="엔터키 입력")
 if search_query:
-    lat, lng, name = search_location(search_query + " Berlin")
+    lat, lng, name = search_location_osm(search_query + " Berlin")
     if lat:
         st.session_state['map_center'] = [lat, lng]
         st.session_state['search_marker'] = {"lat": lat, "lng": lng, "name": name}
         st.sidebar.success(f"이동: {name}")
+    else:
+        st.sidebar.error("장소를 찾을 수 없습니다.")
 
 st.sidebar.divider()
 
-# ★★★ 지도 필터 ★★★
-st.sidebar.subheader("👀 지도 필터 (Layer)")
-show_crime = st.sidebar.checkbox("🚨 범죄 위험도 (지역별)", value=True)
-st.sidebar.caption("켜면 범죄가 많은 지역이 빨간색으로 표시됩니다.")
+# 2. 필터 (Layer Control)
+st.sidebar.subheader("👀 지도 필터")
+show_crime = st.sidebar.checkbox("🚨 범죄 위험도 (2023 엑셀)", value=True)
+st.sidebar.caption("켜면 범죄 빈도에 따라 지역 색상이 변합니다.")
 st.sidebar.write("---")
 show_food = st.sidebar.checkbox("🍽️ 주변 맛집", value=True)
 show_hotel = st.sidebar.checkbox("🏨 숙박시설", value=False)
@@ -263,18 +270,18 @@ show_tour = st.sidebar.checkbox("📸 관광명소", value=False)
 tab1, tab2, tab3, tab4 = st.tabs(["🗺️ 통합 지도", "🚩 추천 코스", "💬 커뮤니티/AI", "📊 범죄 분석"])
 
 # =========================================================
-# TAB 1: 통합 지도 (범죄 + POI)
+# TAB 1: 통합 지도
 # =========================================================
 with tab1:
     center = st.session_state['map_center']
     m = folium.Map(location=center, zoom_start=13)
 
-    # 1. 범죄 데이터 (Choropleth)
+    # 1. 범죄 데이터 레이어 (엑셀 사용)
     if show_crime:
-        crime_df = load_crime_data(CRIME_FILE_NAME)
+        crime_df = load_crime_data_excel(CRIME_FILE_NAME)
         
         if not crime_df.empty:
-            # GeoJSON URL (베를린 구 경계)
+            # 베를린 구 경계 GeoJSON
             geo_url = "https://raw.githubusercontent.com/funkeinteraktiv/Berlin-Geodaten/master/berlin_bezirke.geojson"
             
             folium.Choropleth(
@@ -286,18 +293,21 @@ with tab1:
                 fill_color="YlOrRd",
                 fill_opacity=0.5,
                 line_opacity=0.2,
-                legend_name="총 범죄 발생 건수 (2023)"
+                legend_name="총 범죄 수 (2023)"
             ).add_to(m)
         else:
-            st.error(f"데이터를 불러올 수 없습니다. 파일명 확인: {CRIME_FILE_NAME}")
+            st.error(f"엑셀 파일({CRIME_FILE_NAME})을 읽을 수 없습니다.")
 
-    # 2. 검색 마커
+    # 2. 검색 핀
     if st.session_state['search_marker']:
         sm = st.session_state['search_marker']
-        folium.Marker([sm['lat'], sm['lng']], popup=sm['name'], icon=folium.Icon(color='red', icon='info-sign')).add_to(m)
+        folium.Marker(
+            [sm['lat'], sm['lng']], 
+            popup=sm['name'], 
+            icon=folium.Icon(color='red', icon='info-sign')
+        ).add_to(m)
 
-    # 3. 아이콘 마커 (맛집, 호텔, 관광지)
-    # 맛집 (초록, cutlery)
+    # 3. 장소 마커 (OSM 데이터 - 아이콘 적용)
     if show_food:
         places = get_osm_places('restaurant', center[0], center[1])
         fg_food = folium.FeatureGroup(name="맛집")
@@ -309,7 +319,6 @@ with tab1:
             ).add_to(fg_food)
         fg_food.add_to(m)
 
-    # 호텔 (파랑, bed)
     if show_hotel:
         places = get_osm_places('hotel', center[0], center[1])
         fg_hotel = folium.FeatureGroup(name="호텔")
@@ -321,7 +330,6 @@ with tab1:
             ).add_to(fg_hotel)
         fg_hotel.add_to(m)
 
-    # 관광지 (보라, camera)
     if show_tour:
         places = get_osm_places('tourism', center[0], center[1])
         fg_tour = folium.FeatureGroup(name="관광")
@@ -340,16 +348,12 @@ with tab1:
 # =========================================================
 with tab2:
     st.subheader("🚩 테마별 추천 여행 코스")
-    
     themes = list(courses.keys())
     selected_theme = st.selectbox("테마를 선택하세요", themes)
-    
     course_data = courses[selected_theme]
     
     c_col1, c_col2 = st.columns([2, 1])
-    
     with c_col1:
-        # 코스 지도
         m2 = folium.Map(location=[course_data[2]['lat'], course_data[2]['lng']], zoom_start=13)
         points = []
         for i, item in enumerate(course_data):
@@ -381,29 +385,22 @@ with tab2:
 with tab3:
     c_chat, c_ai = st.columns([1, 1])
     
-    # 1. 장소 추천 (대댓글 포함)
+    # 추천/대댓글
     with c_chat:
         st.subheader("👍 나만의 장소 추천")
-        
         with st.form("rec_form", clear_on_submit=True):
             name = st.text_input("장소 이름")
             reason = st.text_input("추천 이유")
             if st.form_submit_button("등록"):
                 st.session_state['recommendations'].insert(0, {"place": name, "desc": reason, "replies": []})
                 st.rerun()
-        
         st.write("---")
-        
         if st.session_state['recommendations']:
             for i, rec in enumerate(st.session_state['recommendations']):
                 st.markdown(f"**📍 {rec['place']}**")
                 st.success(rec['desc'])
-                
-                # 대댓글 표시
                 for reply in rec['replies']:
                     st.caption(f"↳ {reply}")
-                
-                # 대댓글 입력
                 with st.expander("💬 댓글 달기"):
                     reply_text = st.text_input("내용", key=f"re_{i}")
                     if st.button("등록", key=f"btn_{i}"):
@@ -413,14 +410,13 @@ with tab3:
         else:
             st.info("첫 번째 추천을 남겨보세요!")
 
-    # 2. AI 가이드
+    # AI 챗봇
     with c_ai:
         st.subheader("🤖 Gemini 여행 비서")
         chat_box = st.container(height=500)
         for msg in st.session_state['messages']:
             chat_box.chat_message(msg['role']).write(msg['content'])
-            
-        if prompt := st.chat_input("베를린 여행 질문하기..."):
+        if prompt := st.chat_input("질문하세요..."):
             st.session_state['messages'].append({"role": "user", "content": prompt})
             chat_box.chat_message("user").write(prompt)
             with chat_box.chat_message("assistant"):
@@ -433,47 +429,48 @@ with tab3:
 # =========================================================
 with tab4:
     st.header("📊 베를린 범죄 데이터 상세 분석")
+    st.caption(f"데이터 파일: {CRIME_FILE_NAME}")
     
-    df_stat = load_crime_data(CRIME_FILE_NAME)
+    df_stat = load_crime_data_excel(CRIME_FILE_NAME)
     
     if not df_stat.empty:
-        # 데이터가 있으면 대시보드 표시
-        total_crime = df_stat['Total_Crime'].sum()
-        max_district = df_stat.loc[df_stat['Total_Crime'].idxmax()]['District']
-        
-        k1, k2 = st.columns(2)
-        k1.metric("총 범죄 발생 건수", f"{int(total_crime):,}건")
-        k2.metric("최다 발생 구역", max_district)
-        
-        st.divider()
-        
-        # Plotly 차트
-        col_chart1, col_chart2 = st.columns(2)
-        
-        with col_chart1:
-            st.subheader("🏙️ 구별 범죄 순위")
-            df_sorted = df_stat.sort_values('Total_Crime', ascending=True)
-            fig_bar = px.bar(
-                df_sorted, x='Total_Crime', y='District', orientation='h',
-                text='Total_Crime', title="지역별 범죄 발생 수",
-                color='Total_Crime', color_continuous_scale='Reds'
-            )
-            fig_bar.update_traces(texttemplate='%{text:.2s}', textposition='outside')
-            st.plotly_chart(fig_bar, use_container_width=True)
+        if 'Total_Crime' in df_stat.columns:
+            total_crime = df_stat['Total_Crime'].sum()
+            max_district = df_stat.loc[df_stat['Total_Crime'].idxmax()]['District']
             
-        with col_chart2:
-            st.subheader("🥧 범죄 유형 분석")
-            # 숫자형 컬럼 중 'Total'과 'Code' 등을 제외한 범죄 유형만 추출
-            crime_cols = [c for c in df_stat.columns if c not in ['District', 'Total_Crime', 'LOR-Schlüssel (Bezirksregion)']]
-            # 문자열이 섞여있을 수 있으므로 다시 한번 숫자 변환 후 합계
-            type_sums = df_stat[crime_cols].apply(pd.to_numeric, errors='coerce').sum().sort_values(ascending=False).head(10)
+            k1, k2 = st.columns(2)
+            k1.metric("분석 대상 총 범죄 수", f"{int(total_crime):,}건")
+            k2.metric("최다 발생 구역", max_district)
             
-            fig_pie = px.pie(
-                values=type_sums.values, names=type_sums.index,
-                title="상위 10개 범죄 유형", hole=0.4
-            )
-            fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.divider()
             
+            col_chart1, col_chart2 = st.columns(2)
+            
+            with col_chart1:
+                st.subheader("🏙️ 구별 범죄 순위")
+                df_sorted = df_stat.sort_values('Total_Crime', ascending=True)
+                fig_bar = px.bar(
+                    df_sorted, x='Total_Crime', y='District', orientation='h',
+                    text='Total_Crime', title="지역별 범죄 발생 수",
+                    color='Total_Crime', color_continuous_scale='Reds'
+                )
+                fig_bar.update_traces(texttemplate='%{text:.2s}', textposition='outside')
+                st.plotly_chart(fig_bar, use_container_width=True)
+                
+            with col_chart2:
+                st.subheader("🥧 범죄 유형 분석")
+                crime_cols = [c for c in df_stat.columns if c not in ['District', 'Total_Crime', 'LOR-Schlüssel (Bezirksregion)']]
+                if crime_cols:
+                    type_sums = df_stat[crime_cols].sum().sort_values(ascending=False).head(10)
+                    fig_pie = px.pie(
+                        values=type_sums.values, names=type_sums.index,
+                        title="상위 10개 범죄 유형", hole=0.4
+                    )
+                    fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                    st.plotly_chart(fig_pie, use_container_width=True)
+                else:
+                    st.info("세부 범죄 유형 데이터를 찾을 수 없습니다.")
+        else:
+            st.warning("데이터는 읽었으나 총계 컬럼을 생성하지 못했습니다.")
     else:
         st.warning("데이터를 분석할 수 없습니다. 엑셀 파일을 확인해주세요.")
